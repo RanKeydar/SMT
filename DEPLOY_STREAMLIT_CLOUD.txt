@@ -1,0 +1,17 @@
+# Streamlit Cloud deployment
+
+## קבצים נדרשים בריפו
+- app.py
+- requirements.txt
+
+## שלבי העלאה
+1. צור repository ב-GitHub
+2. העלה את app.py ואת requirements.txt
+3. היכנס ל-Streamlit Community Cloud
+4. בחר New app
+5. בחר את הריפו והקובץ app.py
+6. Deploy
+
+## הערות
+- האפליקציה מבוססת על העלאת קובץ בזמן ריצה, לכן אין צורך לשמור את האקסל בתוך הריפו
+- אם תרצה דמו קבוע, אפשר להוסיף קובץ דוגמה לריפו ולתמוך גם בטעינה אוטומטית
