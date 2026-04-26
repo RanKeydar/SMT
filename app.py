@@ -188,23 +188,29 @@ with st.sidebar:
     uploaded = st.file_uploader('העלה קובץ XLSX', type=['xlsx'])
 
 if not uploaded:
-    st.info('העלה קובץ XLSX כדי להתחיל לעבוד')
-    st.stop()
-
-try:
-    df, title_text = load_excel(uploaded.getvalue())
-except Exception as e:
-    st.error(str(e))
-    st.stop()
+    df = pd.DataFrame(columns=['security_name','security_id','security_type','sector','client_type','client_subtype','buy','sell','net','total','display_group'])
+    title_text = ''
+else:
+    try:
+        df, title_text = load_excel(uploaded.getvalue())
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
 c1, c2, c3 = st.columns([2,1,1])
 with c1:
     query = st.text_input('חיפוש לפי שם נייר או מספר נייר', value='')
 view_mode = st.radio('אופן תצוגה', ['לפי נייר ערך', 'לפי ענף', 'לפי סוג נייר'], horizontal=True)
 with c2:
-    sector_filter = st.selectbox('ענף', ['הכל'] + sorted([x for x in df['sector'].dropna().unique().tolist() if x and x != 'nan']))
+    sector_options = ['הכל'] + sorted([x for x in df['sector'].dropna().unique().tolist() if x and x != 'nan'])
+    sector_filter = st.selectbox('ענף', sector_options)
 with c3:
-    sec_type_filter = st.selectbox('סוג נייר', ['הכל'] + sorted([x for x in df['security_type'].dropna().unique().tolist() if x and x != 'nan']))
+    type_options = ['הכל'] + sorted([x for x in df['security_type'].dropna().unique().tolist() if x and x != 'nan'])
+    sec_type_filter = st.selectbox('סוג נייר', type_options)
+
+if uploaded is None:
+    st.info('העלה קובץ XLSX כדי להתחיל לעבוד')
+    st.stop()
 
 work = df.copy()
 if sector_filter != 'הכל':
