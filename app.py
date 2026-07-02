@@ -692,7 +692,7 @@ with tab_agg:
     for i, (_, groups, val) in enumerate(summary):
         with value_cols[i]:
             st.markdown(
-                f'<div class="value-box {class_for_value(val)}'>{format_num(val)}</div>',
+                f"<div class='value-box {class_for_value(val)}'>{format_num(val)}</div>",
                 unsafe_allow_html=True,
             )
 
