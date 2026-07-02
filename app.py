@@ -179,7 +179,6 @@ def extract_period_label(title_text, fallback_name):
     title = str(title_text).strip()
     if not title:
         return fallback_name
-
     title = re.sub(r"\s+", " ", title)
     return title
 
@@ -246,6 +245,32 @@ def detail_table(selected, groups):
     return out
 
 
+def monthly_detail_table(selected):
+    if selected.empty:
+        return pd.DataFrame()
+
+    out = pd.pivot_table(
+        selected,
+        values=["buy", "sell", "net", "total"],
+        index=["source_period"],
+        aggfunc="sum",
+        fill_value=0,
+        margins=True,
+        margins_name='סה"כ',
+    ).reset_index()
+
+    out = out.rename(
+        columns={
+            "source_period": "תקופה",
+            "buy": "קונה",
+            "sell": "מוכר",
+            "net": "נטו",
+            "total": "כולל",
+        }
+    )
+    return out
+
+
 def render_detail_html(df):
     cols = list(df.columns)
 
@@ -254,7 +279,7 @@ def render_detail_html(df):
         html += f"<th>{c}</th>"
     html += "</tr></thead><tbody>"
 
-    numeric_cols = {"קונה", "מוכר", "נטו", "כולל"}
+    numeric_cols = {"קונה", "מוכר", "נטו", "כולל", 'טווח שינוי'}
 
     for _, r in df.iterrows():
         html += "<tr>"
@@ -419,11 +444,15 @@ def build_comparison_table(filtered_df, compare_by):
         columns="source_period",
         aggfunc="sum",
         fill_value=0,
+        margins=True,
+        margins_name='סה"כ',
     ).reset_index()
 
     period_cols = [c for c in pivot.columns if c not in index_cols]
-    if len(period_cols) >= 2:
-        pivot["טווח שינוי"] = pivot[period_cols].max(axis=1) - pivot[period_cols].min(axis=1)
+    raw_period_cols = [c for c in period_cols if c != 'סה"כ']
+
+    if len(raw_period_cols) >= 2:
+        pivot["טווח שינוי"] = pivot[raw_period_cols].max(axis=1) - pivot[raw_period_cols].min(axis=1)
 
     return pivot
 
@@ -436,7 +465,7 @@ if "downloads" not in st.session_state:
 
 
 st.title("תנועות בניירות ערך")
-st.caption("העלאת כמה קבצים, אגרגציה מאוחדת והשוואה בין תקופות")
+st.caption("העלאת כמה קבצים, אגרגציה מאוחדת, פירוט חודשי והשוואה בין תקופות")
 
 
 with st.sidebar:
@@ -449,7 +478,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("אודות")
-    st.caption("האפליקציה תומכת בהעלאת כמה קבצים במקביל, השוואה לפי תקופה, ואגרגציה כוללת.")
+    st.caption("האפליקציה תומכת בהעלאת כמה קבצים במקביל, השוואה לפי תקופה, פירוט חודשי ואגרגציה כוללת.")
 
 
 if not uploaded_files:
@@ -603,6 +632,12 @@ with tab_agg:
     st.subheader("קבצים ותקופות שנטענו")
     st.dataframe(periods_df, use_container_width=True)
 
+    monthly_df = monthly_detail_table(selected)
+    if not monthly_df.empty:
+        st.divider()
+        st.subheader("פירוט חודשי")
+        st.markdown(render_detail_html(monthly_df), unsafe_allow_html=True)
+
     st.divider()
     st.subheader("ייצוא תוצאה מאוחדת")
 
@@ -626,6 +661,26 @@ with tab_agg:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
+    monthly_export_cols = st.columns(2)
+
+    with monthly_export_cols[0]:
+        if st.button("הכן CSV של הפירוט החודשי", use_container_width=True):
+            prep_download_file(
+                key="monthly_csv",
+                data=to_csv_bytes(monthly_df),
+                file_name="monthly_details.csv",
+                mime="text/csv",
+            )
+
+    with monthly_export_cols[1]:
+        if st.button("הכן Excel של הפירוט החודשי", use_container_width=True):
+            prep_download_file(
+                key="monthly_xlsx",
+                data=to_excel_bytes(monthly_df, sheet_name="monthly_details"),
+                file_name="monthly_details.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
     download_cols = st.columns(2)
 
     if st.session_state.downloads.get("main_csv", {}).get("ready"):
@@ -646,6 +701,30 @@ with tab_agg:
                 data=st.session_state.downloads["main_xlsx"]["data"],
                 file_name=st.session_state.downloads["main_xlsx"]["file_name"],
                 mime=st.session_state.downloads["main_xlsx"]["mime"],
+                on_click="ignore",
+                use_container_width=True,
+            )
+
+    monthly_download_cols = st.columns(2)
+
+    if st.session_state.downloads.get("monthly_csv", {}).get("ready"):
+        with monthly_download_cols[0]:
+            st.download_button(
+                label="הורד CSV של הפירוט החודשי",
+                data=st.session_state.downloads["monthly_csv"]["data"],
+                file_name=st.session_state.downloads["monthly_csv"]["file_name"],
+                mime=st.session_state.downloads["monthly_csv"]["mime"],
+                on_click="ignore",
+                use_container_width=True,
+            )
+
+    if st.session_state.downloads.get("monthly_xlsx", {}).get("ready"):
+        with monthly_download_cols[1]:
+            st.download_button(
+                label="הורד Excel של הפירוט החודשי",
+                data=st.session_state.downloads["monthly_xlsx"]["data"],
+                file_name=st.session_state.downloads["monthly_xlsx"]["file_name"],
+                mime=st.session_state.downloads["monthly_xlsx"]["mime"],
                 on_click="ignore",
                 use_container_width=True,
             )
@@ -709,7 +788,7 @@ with tab_compare:
     if comparison_df.empty:
         st.info("אין נתונים להשוואה תחת הסינון הנוכחי")
     else:
-        st.dataframe(comparison_df, use_container_width=True)
+        st.markdown(render_detail_html(comparison_df), unsafe_allow_html=True)
 
         st.divider()
         st.subheader("ייצוא טבלת השוואה")
