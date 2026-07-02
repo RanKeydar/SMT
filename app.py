@@ -186,7 +186,7 @@ def short_period_label(period_text):
     text = str(period_text)
     dates = re.findall(r"(\d{2})-(\d{2})-(\d{2})", text)
     if dates:
-        day, month, year = dates[-1]
+        _, month, year = dates[-1]
         return f"{month}/{year}"
     months_he = {
         "ינואר": "01", "פברואר": "02", "מרץ": "03", "אפריל": "04",
@@ -214,7 +214,10 @@ def normalize_zero(v):
 def format_num(x):
     try:
         x = normalize_zero(x)
-        return f"{float(x):,.0f}"
+        formatted = f"{float(x):,.0f}"
+        if formatted in ("-0", "-0.0"):
+            return "0"
+        return formatted
     except Exception:
         return str(x)
 
@@ -351,7 +354,7 @@ def render_detail_html(df):
         html += f"<th>{c}</th>"
     html += "</tr></thead><tbody>"
 
-    numeric_cols = {"קונה", "מוכר", "נטו", "כולל", "טווח שינוי"}
+    numeric_cols = {"קונה", "מוכר", "נטו", "כולל", "טווח שינוי", "טווח שינוי נטו"}
 
     for _, r in df.iterrows():
         html += "<tr>"
@@ -462,7 +465,7 @@ def load_multiple_excels(file_payloads):
     return pd.concat(frames, ignore_index=True)
 
 
-def build_comparison_table(filtered_df, compare_by):
+def build_comparison_table(filtered_df, compare_by, metrics=("buy", "sell", "net")):
     if filtered_df.empty:
         return pd.DataFrame(), [], {}
 
@@ -471,45 +474,58 @@ def build_comparison_table(filtered_df, compare_by):
         "לפי ענף": ["sector"],
         "לפי סוג נייר": ["security_type"],
     }
-
     index_cols = group_cols_map[compare_by]
+
+    metrics = list(metrics) if metrics else ["net"]
 
     pivot = pd.pivot_table(
         filtered_df,
-        values="net",
+        values=metrics,
         index=index_cols,
         columns="source_period",
         aggfunc="sum",
         fill_value=0,
         margins=True,
         margins_name='סה"כ',
-    ).reset_index()
+    )
 
-    period_cols = [c for c in pivot.columns if c not in index_cols]
-    raw_period_cols = [c for c in period_cols if c != 'סה"כ']
+    metric_label = {"buy": "קונה", "sell": "מוכר", "net": "נטו", "total": "כולל"}
 
-    for c in raw_period_cols + ['סה"כ']:
-        if c in pivot.columns:
-            pivot[c] = pivot[c].apply(normalize_zero)
+    periods = [p for p in pivot.columns.get_level_values(1).unique().tolist() if p != 'סה"כ']
+    all_period_cols = periods + ['סה"כ']
 
-    if raw_period_cols:
-        mask_non_zero = pivot[raw_period_cols].apply(
-            lambda row: any(abs(float(v)) >= EPSILON for v in row),
-            axis=1
-        )
-        total_rows = pivot[index_cols].astype(str).eq('סה"כ').any(axis=1) if index_cols else pd.Series([False] * len(pivot))
-        pivot = pivot[mask_non_zero | total_rows].copy()
+    flat_cols = []
+    for metric in metrics:
+        for period in all_period_cols:
+            if (metric, period) in pivot.columns:
+                flat_cols.append((metric, period))
 
-    if len(raw_period_cols) >= 2:
-        pivot["טווח שינוי"] = pivot[raw_period_cols].max(axis=1) - pivot[raw_period_cols].min(axis=1)
-        pivot["טווח שינוי"] = pivot["טווח שינוי"].apply(normalize_zero)
+    pivot = pivot.reindex(columns=pd.MultiIndex.from_tuples(flat_cols))
+    pivot = pivot.reset_index()
 
-    rename_map = {col: short_period_label(col) for col in raw_period_cols}
-    pivot = pivot.rename(columns=rename_map)
+    short_map = {p: short_period_label(p) for p in periods}
+    short_map['סה"כ'] = 'סה"כ'
 
-    short_period_cols = [rename_map[c] for c in raw_period_cols]
+    new_col_names = list(index_cols)
+    period_metric_cols = []
 
-    return pivot, short_period_cols, rename_map
+    for metric, period in flat_cols:
+        label = f"{short_map[period]} {metric_label[metric]}"
+        new_col_names.append(label)
+        period_metric_cols.append(label)
+
+    pivot.columns = new_col_names
+
+    for c in period_metric_cols:
+        pivot[c] = pivot[c].apply(normalize_zero)
+
+    if len(periods) >= 2 and "net" in metrics:
+        net_cols = [f"{short_map[p]} נטו" for p in periods]
+        pivot["טווח שינוי נטו"] = pivot[net_cols].max(axis=1) - pivot[net_cols].min(axis=1)
+        pivot["טווח שינוי נטו"] = pivot["טווח שינוי נטו"].apply(normalize_zero)
+        period_metric_cols.append("טווח שינוי נטו")
+
+    return pivot, period_metric_cols, short_map
 
 
 def paginate_df(df, page_key, page_size=20):
@@ -596,7 +612,12 @@ with tab_agg:
         sec_type_filter = st.selectbox("סוג נייר", type_options, key="agg_type")
 
     period_options = ["הכל"] + sorted(df["source_period"].dropna().unique().tolist())
-    selected_period = st.selectbox("תקופה", period_options, key="agg_period")
+    selected_period = st.selectbox(
+        "תקופה",
+        period_options,
+        key="agg_period",
+        format_func=lambda p: "הכל" if p == "הכל" else short_period_label(p),
+    )
 
     work = df.copy()
 
@@ -692,7 +713,7 @@ with tab_agg:
     for i, (_, groups, val) in enumerate(summary):
         with value_cols[i]:
             st.markdown(
-                f"<div class='value-box {class_for_value(val)}'>{format_num(val)}</div>",
+                f'<div class="value-box {class_for_value(val)}">{format_num(val)}</div>',
                 unsafe_allow_html=True,
             )
 
@@ -707,7 +728,7 @@ with tab_agg:
         st.divider()
         st.subheader("טבלאות נפרדות לפי תקופה")
         for period, tbl in period_tables:
-            st.markdown(f"### {period}")
+            st.markdown(f"### {short_period_label(period)}")
             st.markdown(render_detail_html(tbl), unsafe_allow_html=True)
 
     st.divider()
@@ -742,7 +763,6 @@ with tab_agg:
                     data=st.session_state.downloads["main_csv"]["data"],
                     file_name=st.session_state.downloads["main_csv"]["file_name"],
                     mime=st.session_state.downloads["main_csv"]["mime"],
-                    on_click="ignore",
                     use_container_width=True,
                 )
 
@@ -753,7 +773,6 @@ with tab_agg:
                     data=st.session_state.downloads["main_xlsx"]["data"],
                     file_name=st.session_state.downloads["main_xlsx"]["file_name"],
                     mime=st.session_state.downloads["main_xlsx"]["mime"],
-                    on_click="ignore",
                     use_container_width=True,
                 )
 
@@ -806,6 +825,16 @@ with tab_compare:
             key="compare_type",
         )
 
+    compare_metrics_labels = st.multiselect(
+        "עמודות להצגה",
+        ["קונה", "מוכר", "נטו"],
+        default=["קונה", "מוכר", "נטו"],
+        key="compare_metrics",
+    )
+
+    metric_key_map = {"קונה": "buy", "מוכר": "sell", "נטו": "net"}
+    selected_metrics = tuple(metric_key_map[m] for m in compare_metrics_labels) or ("net",)
+
     compare_work = df.copy()
 
     if compare_sector != "הכל":
@@ -821,14 +850,22 @@ with tab_compare:
             | compare_work["security_id"].str.contains(q, case=False, na=False)
         ]
 
-    comparison_df, short_period_cols, _ = build_comparison_table(compare_work, compare_mode)
+    comparison_df, period_metric_cols, _ = build_comparison_table(compare_work, compare_mode, selected_metrics)
 
     if comparison_df.empty:
         st.info("אין נתונים להשוואה תחת הסינון הנוכחי")
     else:
-        total_row_mask = comparison_df.astype(str).eq("סה\"כ").any(axis=1)
+        total_row_mask = comparison_df.astype(str).eq('סה"כ').any(axis=1)
         total_row = comparison_df[total_row_mask].copy()
         base_rows = comparison_df[~total_row_mask].copy()
+
+        net_cols_for_filter = [c for c in period_metric_cols if c.endswith("נטו")]
+        if net_cols_for_filter:
+            mask_non_zero = base_rows[net_cols_for_filter].apply(
+                lambda row: any(abs(float(v)) >= EPSILON for v in row),
+                axis=1
+            )
+            base_rows = base_rows[mask_non_zero].copy()
 
         paged_df, current_page, total_pages, total_rows = paginate_df(base_rows, "compare_page", PAGE_SIZE)
         display_df = pd.concat([paged_df, total_row], ignore_index=True) if not total_row.empty else paged_df
@@ -838,23 +875,17 @@ with tab_compare:
         column_config = {}
 
         if "security_id" in display_df.columns:
-            column_config["security_id"] = st.column_config.Column("מס' ני\"ע", width="small")
+            column_config["security_id"] = st.column_config.Column("מס'", width="small")
         if "security_name" in display_df.columns:
-            column_config["security_name"] = st.column_config.Column("ני\"ע", width="small")
+            column_config["security_name"] = st.column_config.Column('ני"ע', width="medium")
         if "sector" in display_df.columns:
             column_config["sector"] = st.column_config.Column("ענף", width="small")
         if "security_type" in display_df.columns:
-            column_config["security_type"] = st.column_config.Column("סוג נייר", width="small")
+            column_config["security_type"] = st.column_config.Column("סוג", width="small")
 
-        for col in short_period_cols:
+        for col in period_metric_cols:
             if col in display_df.columns:
                 column_config[col] = st.column_config.NumberColumn(col, width="small", format="%d")
-
-        if "סה\"כ" in display_df.columns:
-            column_config['סה"כ'] = st.column_config.NumberColumn('סה"כ', width="small", format="%d")
-
-        if "טווח שינוי" in display_df.columns:
-            column_config["טווח שינוי"] = st.column_config.NumberColumn("טווח", width="small", format="%d")
 
         st.dataframe(
             display_df,
@@ -914,7 +945,6 @@ with tab_compare:
                         data=st.session_state.downloads["compare_csv"]["data"],
                         file_name=st.session_state.downloads["compare_csv"]["file_name"],
                         mime=st.session_state.downloads["compare_csv"]["mime"],
-                        on_click="ignore",
                         use_container_width=True,
                     )
 
@@ -925,6 +955,5 @@ with tab_compare:
                         data=st.session_state.downloads["compare_xlsx"]["data"],
                         file_name=st.session_state.downloads["compare_xlsx"]["file_name"],
                         mime=st.session_state.downloads["compare_xlsx"]["mime"],
-                        on_click="ignore",
                         use_container_width=True,
                     )
