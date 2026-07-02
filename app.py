@@ -1,3 +1,4 @@
+import math
 import os
 import pathlib
 import re
@@ -72,6 +73,7 @@ COLUMN_DEFS = [
 ]
 
 EPSILON = 1e-6
+PAGE_SIZE = 20
 
 
 st.markdown(
@@ -178,6 +180,25 @@ def extract_period_label(title_text, fallback_name):
     if not title:
         return fallback_name
     return re.sub(r"\s+", " ", title)
+
+
+def short_period_label(period_text):
+    text = str(period_text)
+    dates = re.findall(r"(\d{2})-(\d{2})-(\d{2})", text)
+    if dates:
+        day, month, year = dates[-1]
+        return f"{month}/{year}"
+    months_he = {
+        "ינואר": "01", "פברואר": "02", "מרץ": "03", "אפריל": "04",
+        "מאי": "05", "יוני": "06", "יולי": "07", "אוגוסט": "08",
+        "ספטמבר": "09", "אוקטובר": "10", "נובמבר": "11", "דצמבר": "12",
+    }
+    for name, num in months_he.items():
+        if name in text:
+            year_match = re.search(r"20(\d{2})", text)
+            yy = year_match.group(1) if year_match else ""
+            return f"{num}/{yy}" if yy else num
+    return text[:18]
 
 
 def normalize_zero(v):
@@ -443,7 +464,7 @@ def load_multiple_excels(file_payloads):
 
 def build_comparison_table(filtered_df, compare_by):
     if filtered_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), [], {}
 
     group_cols_map = {
         "לפי נייר ערך": ["security_id", "security_name"],
@@ -471,11 +492,42 @@ def build_comparison_table(filtered_df, compare_by):
         if c in pivot.columns:
             pivot[c] = pivot[c].apply(normalize_zero)
 
+    if raw_period_cols:
+        mask_non_zero = pivot[raw_period_cols].apply(
+            lambda row: any(abs(float(v)) >= EPSILON for v in row),
+            axis=1
+        )
+        total_rows = pivot[index_cols].astype(str).eq('סה"כ').any(axis=1) if index_cols else pd.Series([False] * len(pivot))
+        pivot = pivot[mask_non_zero | total_rows].copy()
+
     if len(raw_period_cols) >= 2:
         pivot["טווח שינוי"] = pivot[raw_period_cols].max(axis=1) - pivot[raw_period_cols].min(axis=1)
         pivot["טווח שינוי"] = pivot["טווח שינוי"].apply(normalize_zero)
 
-    return pivot
+    rename_map = {col: short_period_label(col) for col in raw_period_cols}
+    pivot = pivot.rename(columns=rename_map)
+
+    short_period_cols = [rename_map[c] for c in raw_period_cols]
+
+    return pivot, short_period_cols, rename_map
+
+
+def paginate_df(df, page_key, page_size=20):
+    if df.empty:
+        return df, 1, 1, 0
+
+    total_rows = len(df)
+    total_pages = max(1, math.ceil(total_rows / page_size))
+
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 1
+
+    st.session_state[page_key] = min(max(1, st.session_state[page_key]), total_pages)
+
+    start_idx = (st.session_state[page_key] - 1) * page_size
+    end_idx = start_idx + page_size
+
+    return df.iloc[start_idx:end_idx].copy(), st.session_state[page_key], total_pages, total_rows
 
 
 if "detail_groups" not in st.session_state:
@@ -483,6 +535,9 @@ if "detail_groups" not in st.session_state:
 
 if "downloads" not in st.session_state:
     st.session_state.downloads = {}
+
+if "compare_page" not in st.session_state:
+    st.session_state.compare_page = 1
 
 
 st.title("תנועות בניירות ערך")
@@ -637,7 +692,7 @@ with tab_agg:
     for i, (_, groups, val) in enumerate(summary):
         with value_cols[i]:
             st.markdown(
-                f'<div class="value-box {class_for_value(val)}">{format_num(val)}</div>',
+                f'<div class="value-box {class_for_value(val)}'>{format_num(val)}</div>',
                 unsafe_allow_html=True,
             )
 
@@ -766,12 +821,65 @@ with tab_compare:
             | compare_work["security_id"].str.contains(q, case=False, na=False)
         ]
 
-    comparison_df = build_comparison_table(compare_work, compare_mode)
+    comparison_df, short_period_cols, _ = build_comparison_table(compare_work, compare_mode)
 
     if comparison_df.empty:
         st.info("אין נתונים להשוואה תחת הסינון הנוכחי")
     else:
-        st.markdown(render_detail_html(comparison_df), unsafe_allow_html=True)
+        total_row_mask = comparison_df.astype(str).eq("סה\"כ").any(axis=1)
+        total_row = comparison_df[total_row_mask].copy()
+        base_rows = comparison_df[~total_row_mask].copy()
+
+        paged_df, current_page, total_pages, total_rows = paginate_df(base_rows, "compare_page", PAGE_SIZE)
+        display_df = pd.concat([paged_df, total_row], ignore_index=True) if not total_row.empty else paged_df
+
+        st.caption(f"מציג {min(len(paged_df), PAGE_SIZE)} מתוך {len(base_rows)} תוצאות, דף {current_page} מתוך {total_pages}")
+
+        column_config = {}
+
+        if "security_id" in display_df.columns:
+            column_config["security_id"] = st.column_config.Column("מס' ני\"ע", width="small")
+        if "security_name" in display_df.columns:
+            column_config["security_name"] = st.column_config.Column("ני\"ע", width="small")
+        if "sector" in display_df.columns:
+            column_config["sector"] = st.column_config.Column("ענף", width="small")
+        if "security_type" in display_df.columns:
+            column_config["security_type"] = st.column_config.Column("סוג נייר", width="small")
+
+        for col in short_period_cols:
+            if col in display_df.columns:
+                column_config[col] = st.column_config.NumberColumn(col, width="small", format="%d")
+
+        if "סה\"כ" in display_df.columns:
+            column_config['סה"כ'] = st.column_config.NumberColumn('סה"כ', width="small", format="%d")
+
+        if "טווח שינוי" in display_df.columns:
+            column_config["טווח שינוי"] = st.column_config.NumberColumn("טווח", width="small", format="%d")
+
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config=column_config,
+        )
+
+        nav1, nav2, nav3 = st.columns([1, 2, 1])
+
+        with nav1:
+            if st.button("הקודם", disabled=current_page <= 1, use_container_width=True):
+                st.session_state.compare_page = max(1, st.session_state.compare_page - 1)
+                st.rerun()
+
+        with nav2:
+            st.markdown(
+                f"<div style='text-align:center;padding-top:8px;'>דף {current_page} / {total_pages}</div>",
+                unsafe_allow_html=True,
+            )
+
+        with nav3:
+            if st.button("הבא", disabled=current_page >= total_pages, use_container_width=True):
+                st.session_state.compare_page = min(total_pages, st.session_state.compare_page + 1)
+                st.rerun()
 
         st.divider()
         st.subheader("ייצוא טבלת השוואה")
