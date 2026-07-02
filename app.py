@@ -22,7 +22,6 @@ def inject_ga_to_streamlit_head():
         return
 
     ga_tag = f"""
-    <!-- Google tag (gtag.js) -->
     <script async src="https://www.googletagmanager.com/gtag/js?id={ga_id}"></script>
     <script id="google_analytics">
       window.dataLayer = window.dataLayer || [];
@@ -49,7 +48,6 @@ def inject_ga_to_streamlit_head():
 
 inject_ga_to_streamlit_head()
 
-
 SHEET_NAME = "הכל"
 
 REQUIRED_HEADERS = [
@@ -72,6 +70,8 @@ COLUMN_DEFS = [
     ("נוסטרו", ["נוסטרו"]),
     ("תושב חוץ", ["משקיע חוץ"]),
 ]
+
+EPSILON = 1e-6
 
 
 st.markdown(
@@ -165,13 +165,11 @@ st.markdown(
 def find_header_row(raw, required_headers, scan_rows=12):
     limit = min(scan_rows, len(raw))
     best_idx, best_score = None, -1
-
     for i in range(limit):
         row_vals = set(raw.iloc[i].fillna("").astype(str).str.strip().tolist())
         score = sum(1 for h in required_headers if h in row_vals)
         if score > best_score:
             best_idx, best_score = i, score
-
     return best_idx, best_score
 
 
@@ -179,19 +177,37 @@ def extract_period_label(title_text, fallback_name):
     title = str(title_text).strip()
     if not title:
         return fallback_name
-    title = re.sub(r"\s+", " ", title)
-    return title
+    return re.sub(r"\s+", " ", title)
+
+
+def normalize_zero(v):
+    try:
+        x = float(v)
+        if abs(x) < EPSILON:
+            return 0.0
+        return x
+    except Exception:
+        return v
 
 
 def format_num(x):
     try:
+        x = normalize_zero(x)
         return f"{float(x):,.0f}"
     except Exception:
         return str(x)
 
 
 def class_for_value(v):
-    return "pos" if v > 0 else "neg" if v < 0 else "zero"
+    try:
+        x = normalize_zero(v)
+        if x > 0:
+            return "pos"
+        if x < 0:
+            return "neg"
+        return "zero"
+    except Exception:
+        return "zero"
 
 
 def normalize_group(row):
@@ -218,6 +234,7 @@ def build_summary_values(selected):
     row = []
     for label, keys in COLUMN_DEFS:
         val = sum(mapping.get(k, 0) for k in keys)
+        val = normalize_zero(val)
         row.append((label, keys, val))
 
     return row
@@ -231,6 +248,9 @@ def detail_table(selected, groups):
     out = rows.groupby(["client_type", "client_subtype"], as_index=False)[
         ["buy", "sell", "net", "total"]
     ].sum()
+
+    for c in ["buy", "sell", "net", "total"]:
+        out[c] = out[c].apply(normalize_zero)
 
     out = out.rename(
         columns={
@@ -249,15 +269,24 @@ def monthly_detail_table(selected):
     if selected.empty:
         return pd.DataFrame()
 
-    out = pd.pivot_table(
-        selected,
-        values=["buy", "sell", "net", "total"],
-        index=["source_period"],
-        aggfunc="sum",
-        fill_value=0,
-        margins=True,
-        margins_name='סה"כ',
-    ).reset_index()
+    out = (
+        selected.groupby("source_period", as_index=False)[["buy", "sell", "net", "total"]]
+        .sum()
+        .sort_values("source_period")
+    )
+
+    for c in ["buy", "sell", "net", "total"]:
+        out[c] = out[c].apply(normalize_zero)
+
+    total_row = pd.DataFrame([{
+        "source_period": 'סה"כ',
+        "buy": normalize_zero(out["buy"].sum()),
+        "sell": normalize_zero(out["sell"].sum()),
+        "net": normalize_zero(out["net"].sum()),
+        "total": normalize_zero(out["total"].sum()),
+    }])
+
+    out = pd.concat([out, total_row], ignore_index=True)
 
     out = out.rename(
         columns={
@@ -271,15 +300,37 @@ def monthly_detail_table(selected):
     return out
 
 
+def period_breakdown_tables(selected):
+    if selected.empty:
+        return []
+
+    period_tables = []
+    for period in sorted(selected["source_period"].dropna().unique().tolist()):
+        period_df = selected[selected["source_period"] == period].copy()
+        tbl = detail_table(period_df, period_df["display_group"].unique().tolist())
+        if tbl is not None and not tbl.empty:
+            summary_row = pd.DataFrame([{
+                "סוג לקוח": 'סה"כ',
+                "תת סוג לקוח": "",
+                "קונה": normalize_zero(tbl["קונה"].sum()),
+                "מוכר": normalize_zero(tbl["מוכר"].sum()),
+                "נטו": normalize_zero(tbl["נטו"].sum()),
+                "כולל": normalize_zero(tbl["כולל"].sum()),
+            }])
+            tbl = pd.concat([tbl, summary_row], ignore_index=True)
+            period_tables.append((period, tbl))
+
+    return period_tables
+
+
 def render_detail_html(df):
     cols = list(df.columns)
-
     html = '<div class="detail-html"><table><thead><tr>'
     for c in cols:
         html += f"<th>{c}</th>"
     html += "</tr></thead><tbody>"
 
-    numeric_cols = {"קונה", "מוכר", "נטו", "כולל", 'טווח שינוי'}
+    numeric_cols = {"קונה", "מוכר", "נטו", "כולל", "טווח שינוי"}
 
     for _, r in df.iterrows():
         html += "<tr>"
@@ -290,7 +341,6 @@ def render_detail_html(df):
             else:
                 html += f"<td>{val}</td>"
         html += "</tr>"
-
     html += "</tbody></table></div>"
     return html
 
@@ -328,13 +378,10 @@ def load_excel_single(file_obj):
         raise ValueError(f'לא הצלחתי לזהות אוטומטית את שורת הכותרות בקובץ "{file_obj.name}"')
 
     headers = raw.iloc[header_row].fillna("").astype(str).str.strip().tolist()
-    df = raw.iloc[header_row + 1 :].copy()
+    df = raw.iloc[header_row + 1:].copy()
     df.columns = headers
 
-    df = df.loc[
-        :,
-        [c for c in df.columns if str(c).strip() and not str(c).startswith("Unnamed:")],
-    ]
+    df = df.loc[:, [c for c in df.columns if str(c).strip() and not str(c).startswith("Unnamed:")]]
 
     df = df.rename(
         columns={
@@ -352,16 +399,8 @@ def load_excel_single(file_obj):
     )
 
     needed = [
-        "security_name",
-        "security_id",
-        "security_type",
-        "sector",
-        "client_type",
-        "client_subtype",
-        "buy",
-        "sell",
-        "net",
-        "total",
+        "security_name", "security_id", "security_type", "sector",
+        "client_type", "client_subtype", "buy", "sell", "net", "total"
     ]
 
     for c in needed:
@@ -369,27 +408,16 @@ def load_excel_single(file_obj):
             df[c] = None
 
     for c in ["buy", "sell", "net", "total"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).apply(normalize_zero)
 
-    for c in [
-        "security_name",
-        "security_id",
-        "security_type",
-        "sector",
-        "client_type",
-        "client_subtype",
-    ]:
+    for c in ["security_name", "security_id", "security_type", "sector", "client_type", "client_subtype"]:
         df[c] = df[c].astype(str).str.strip()
 
     df = df[
-        df["security_name"].notna()
-        & (df["security_name"] != "")
-        & (df["security_name"] != "nan")
+        df["security_name"].notna() & (df["security_name"] != "") & (df["security_name"] != "nan")
     ]
     df = df[
-        df["security_id"].notna()
-        & (df["security_id"] != "")
-        & (df["security_id"] != "nan")
+        df["security_id"].notna() & (df["security_id"] != "") & (df["security_id"] != "nan")
     ]
 
     df["display_group"] = df.apply(normalize_group, axis=1)
@@ -402,27 +430,15 @@ def load_excel_single(file_obj):
 @st.cache_data(show_spinner=False)
 def load_multiple_excels(file_payloads):
     frames = []
-    periods = []
-
     for item in file_payloads:
         fake_file = item["uploaded_file"]
-        df, title_text = load_excel_single(fake_file)
+        df, _ = load_excel_single(fake_file)
         frames.append(df)
-        periods.append(
-            {
-                "source_file": fake_file.name,
-                "source_period": extract_period_label(title_text, fake_file.name),
-                "title_text": title_text,
-                "rows": len(df),
-            }
-        )
 
     if not frames:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
-    combined = pd.concat(frames, ignore_index=True)
-    periods_df = pd.DataFrame(periods)
-    return combined, periods_df
+    return pd.concat(frames, ignore_index=True)
 
 
 def build_comparison_table(filtered_df, compare_by):
@@ -451,8 +467,13 @@ def build_comparison_table(filtered_df, compare_by):
     period_cols = [c for c in pivot.columns if c not in index_cols]
     raw_period_cols = [c for c in period_cols if c != 'סה"כ']
 
+    for c in raw_period_cols + ['סה"כ']:
+        if c in pivot.columns:
+            pivot[c] = pivot[c].apply(normalize_zero)
+
     if len(raw_period_cols) >= 2:
         pivot["טווח שינוי"] = pivot[raw_period_cols].max(axis=1) - pivot[raw_period_cols].min(axis=1)
+        pivot["טווח שינוי"] = pivot["טווח שינוי"].apply(normalize_zero)
 
     return pivot
 
@@ -467,7 +488,6 @@ if "downloads" not in st.session_state:
 st.title("תנועות בניירות ערך")
 st.caption("העלאת כמה קבצים, אגרגציה מאוחדת, פירוט חודשי והשוואה בין תקופות")
 
-
 with st.sidebar:
     st.header("טעינת נתונים")
     uploaded_files = st.file_uploader(
@@ -478,18 +498,17 @@ with st.sidebar:
 
     st.divider()
     st.subheader("אודות")
-    st.caption("האפליקציה תומכת בהעלאת כמה קבצים במקביל, השוואה לפי תקופה, פירוט חודשי ואגרגציה כוללת.")
+    st.caption("האפליקציה תומכת בהעלאת כמה קבצים במקביל, השוואה לפי תקופה ופירוט נפרד לכל תקופה.")
 
 
 if not uploaded_files:
     st.info("העלה לפחות קובץ XLSX אחד כדי להתחיל לעבוד")
     st.stop()
 
-
 file_payloads = [{"uploaded_file": f} for f in uploaded_files]
 
 try:
-    df, periods_df = load_multiple_excels(file_payloads)
+    df = load_multiple_excels(file_payloads)
 except Exception as e:
     st.error(str(e))
     st.stop()
@@ -498,9 +517,7 @@ if df.empty:
     st.warning("לא נטענו נתונים")
     st.stop()
 
-
 tab_agg, tab_compare = st.tabs(["אגרגציה מאוחדת", "השוואה בין תקופות"])
-
 
 with tab_agg:
     c1, c2, c3 = st.columns([2, 1, 1])
@@ -516,18 +533,14 @@ with tab_agg:
     )
 
     with c2:
-        sector_options = ["הכל"] + sorted(
-            [x for x in df["sector"].dropna().unique().tolist() if x and x != "nan"]
-        )
+        sector_options = ["הכל"] + sorted([x for x in df["sector"].dropna().unique().tolist() if x and x != "nan"])
         sector_filter = st.selectbox("ענף", sector_options, key="agg_sector")
 
     with c3:
-        type_options = ["הכל"] + sorted(
-            [x for x in df["security_type"].dropna().unique().tolist() if x and x != "nan"]
-        )
+        type_options = ["הכל"] + sorted([x for x in df["security_type"].dropna().unique().tolist() if x and x != "nan"])
         sec_type_filter = st.selectbox("סוג נייר", type_options, key="agg_type")
 
-    period_options = ["הכל"] + periods_df["source_period"].drop_duplicates().tolist()
+    period_options = ["הכל"] + sorted(df["source_period"].dropna().unique().tolist())
     selected_period = st.selectbox("תקופה", period_options, key="agg_period")
 
     work = df.copy()
@@ -610,7 +623,7 @@ with tab_agg:
 
     st.markdown(f'<div class="result-title">{security_label}</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="period-text">מספר קבצים נטענו: {len(periods_df)}</div>',
+        f'<div class="period-text">מספר תקופות בטעינה: {selected["source_period"].nunique()}</div>',
         unsafe_allow_html=True,
     )
 
@@ -628,21 +641,24 @@ with tab_agg:
                 unsafe_allow_html=True,
             )
 
-    st.divider()
-    st.subheader("קבצים ותקופות שנטענו")
-    st.dataframe(periods_df, use_container_width=True)
-
     monthly_df = monthly_detail_table(selected)
     if not monthly_df.empty:
         st.divider()
-        st.subheader("פירוט חודשי")
+        st.subheader("פירוט חודשי מרוכז")
         st.markdown(render_detail_html(monthly_df), unsafe_allow_html=True)
+
+    period_tables = period_breakdown_tables(selected)
+    if period_tables:
+        st.divider()
+        st.subheader("טבלאות נפרדות לפי תקופה")
+        for period, tbl in period_tables:
+            st.markdown(f"### {period}")
+            st.markdown(render_detail_html(tbl), unsafe_allow_html=True)
 
     st.divider()
     st.subheader("ייצוא תוצאה מאוחדת")
 
     prep_cols = st.columns(2)
-
     with prep_cols[0]:
         if st.button("הכן CSV של התוצאה המאוחדת", use_container_width=True):
             prep_download_file(
@@ -661,77 +677,44 @@ with tab_agg:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-    monthly_export_cols = st.columns(2)
+    if st.session_state.downloads.get("main_csv", {}).get("ready") or st.session_state.downloads.get("main_xlsx", {}).get("ready"):
+        download_cols = st.columns(2)
 
-    with monthly_export_cols[0]:
-        if st.button("הכן CSV של הפירוט החודשי", use_container_width=True):
-            prep_download_file(
-                key="monthly_csv",
-                data=to_csv_bytes(monthly_df),
-                file_name="monthly_details.csv",
-                mime="text/csv",
-            )
+        if st.session_state.downloads.get("main_csv", {}).get("ready"):
+            with download_cols[0]:
+                st.download_button(
+                    label="הורד CSV של התוצאה המאוחדת",
+                    data=st.session_state.downloads["main_csv"]["data"],
+                    file_name=st.session_state.downloads["main_csv"]["file_name"],
+                    mime=st.session_state.downloads["main_csv"]["mime"],
+                    on_click="ignore",
+                    use_container_width=True,
+                )
 
-    with monthly_export_cols[1]:
-        if st.button("הכן Excel של הפירוט החודשי", use_container_width=True):
-            prep_download_file(
-                key="monthly_xlsx",
-                data=to_excel_bytes(monthly_df, sheet_name="monthly_details"),
-                file_name="monthly_details.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-    download_cols = st.columns(2)
-
-    if st.session_state.downloads.get("main_csv", {}).get("ready"):
-        with download_cols[0]:
-            st.download_button(
-                label="הורד CSV של התוצאה המאוחדת",
-                data=st.session_state.downloads["main_csv"]["data"],
-                file_name=st.session_state.downloads["main_csv"]["file_name"],
-                mime=st.session_state.downloads["main_csv"]["mime"],
-                on_click="ignore",
-                use_container_width=True,
-            )
-
-    if st.session_state.downloads.get("main_xlsx", {}).get("ready"):
-        with download_cols[1]:
-            st.download_button(
-                label="הורד Excel של התוצאה המאוחדת",
-                data=st.session_state.downloads["main_xlsx"]["data"],
-                file_name=st.session_state.downloads["main_xlsx"]["file_name"],
-                mime=st.session_state.downloads["main_xlsx"]["mime"],
-                on_click="ignore",
-                use_container_width=True,
-            )
-
-    monthly_download_cols = st.columns(2)
-
-    if st.session_state.downloads.get("monthly_csv", {}).get("ready"):
-        with monthly_download_cols[0]:
-            st.download_button(
-                label="הורד CSV של הפירוט החודשי",
-                data=st.session_state.downloads["monthly_csv"]["data"],
-                file_name=st.session_state.downloads["monthly_csv"]["file_name"],
-                mime=st.session_state.downloads["monthly_csv"]["mime"],
-                on_click="ignore",
-                use_container_width=True,
-            )
-
-    if st.session_state.downloads.get("monthly_xlsx", {}).get("ready"):
-        with monthly_download_cols[1]:
-            st.download_button(
-                label="הורד Excel של הפירוט החודשי",
-                data=st.session_state.downloads["monthly_xlsx"]["data"],
-                file_name=st.session_state.downloads["monthly_xlsx"]["file_name"],
-                mime=st.session_state.downloads["monthly_xlsx"]["mime"],
-                on_click="ignore",
-                use_container_width=True,
-            )
+        if st.session_state.downloads.get("main_xlsx", {}).get("ready"):
+            with download_cols[1]:
+                st.download_button(
+                    label="הורד Excel של התוצאה המאוחדת",
+                    data=st.session_state.downloads["main_xlsx"]["data"],
+                    file_name=st.session_state.downloads["main_xlsx"]["file_name"],
+                    mime=st.session_state.downloads["main_xlsx"]["mime"],
+                    on_click="ignore",
+                    use_container_width=True,
+                )
 
     if st.session_state.detail_groups:
         details = detail_table(selected, st.session_state.detail_groups)
         if details is not None:
+            summary_row = pd.DataFrame([{
+                "סוג לקוח": 'סה"כ',
+                "תת סוג לקוח": "",
+                "קונה": normalize_zero(details["קונה"].sum()),
+                "מוכר": normalize_zero(details["מוכר"].sum()),
+                "נטו": normalize_zero(details["נטו"].sum()),
+                "כולל": normalize_zero(details["כולל"].sum()),
+            }])
+            details = pd.concat([details, summary_row], ignore_index=True)
+
             st.markdown(
                 '<div class="detail-title"><h3>תנועות לחיתוך שנבחר</h3></div>',
                 unsafe_allow_html=True,
@@ -813,26 +796,27 @@ with tab_compare:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-        cmp_download_cols = st.columns(2)
+        if st.session_state.downloads.get("compare_csv", {}).get("ready") or st.session_state.downloads.get("compare_xlsx", {}).get("ready"):
+            cmp_download_cols = st.columns(2)
 
-        if st.session_state.downloads.get("compare_csv", {}).get("ready"):
-            with cmp_download_cols[0]:
-                st.download_button(
-                    label="הורד CSV של ההשוואה",
-                    data=st.session_state.downloads["compare_csv"]["data"],
-                    file_name=st.session_state.downloads["compare_csv"]["file_name"],
-                    mime=st.session_state.downloads["compare_csv"]["mime"],
-                    on_click="ignore",
-                    use_container_width=True,
-                )
+            if st.session_state.downloads.get("compare_csv", {}).get("ready"):
+                with cmp_download_cols[0]:
+                    st.download_button(
+                        label="הורד CSV של ההשוואה",
+                        data=st.session_state.downloads["compare_csv"]["data"],
+                        file_name=st.session_state.downloads["compare_csv"]["file_name"],
+                        mime=st.session_state.downloads["compare_csv"]["mime"],
+                        on_click="ignore",
+                        use_container_width=True,
+                    )
 
-        if st.session_state.downloads.get("compare_xlsx", {}).get("ready"):
-            with cmp_download_cols[1]:
-                st.download_button(
-                    label="הורד Excel של ההשוואה",
-                    data=st.session_state.downloads["compare_xlsx"]["data"],
-                    file_name=st.session_state.downloads["compare_xlsx"]["file_name"],
-                    mime=st.session_state.downloads["compare_xlsx"]["mime"],
-                    on_click="ignore",
-                    use_container_width=True,
-                )
+            if st.session_state.downloads.get("compare_xlsx", {}).get("ready"):
+                with cmp_download_cols[1]:
+                    st.download_button(
+                        label="הורד Excel של ההשוואה",
+                        data=st.session_state.downloads["compare_xlsx"]["data"],
+                        file_name=st.session_state.downloads["compare_xlsx"]["file_name"],
+                        mime=st.session_state.downloads["compare_xlsx"]["mime"],
+                        on_click="ignore",
+                        use_container_width=True,
+                    )
